@@ -30,3 +30,9 @@
     * **On Desktop (for playback):**
         Open `https://your_ngrok_url/read.php` in your desktop browser.
         * Select a recording from the list (defaults to latest), then "Play" or adjust sliders.
+
+Screenshots:
+
+![image](https://github.com/user-attachments/assets/c4e6749b-63ad-4dfd-8270-b1ee9d609516)
+
+![image](https://github.com/user-attachments/assets/aeb440cd-1e02-4a65-a5b4-861efe138ad1)
