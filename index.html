@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Accelerometer Recorder</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:system-ui,Arial,sans-serif;margin:2rem;}
+    button{padding:.7rem 1.3rem;font-size:1rem;border:none;border-radius:.4rem;cursor:pointer;}
+    #recordBtn{background:#007bff;color:#fff;}
+    #stopBtn{background:#dc3545;color:#fff;display:none;}
+    #status{margin-top:1rem;font-weight:600;}
+    #counter{font-variant-numeric:tabular-nums;}
+  </style>
+</head>
+<body>
+  <h1>Phone Accelerometer Recorder</h1>
+  <button id="recordBtn">Start Recording</button>
+  <button id="stopBtn">Stop & Upload</button>
+  <p id="status">Waiting…</p>
+  <p><span id="counter">0</span> datapoints captured</p>
+
+<script type="module">
+import { Quaternion, Euler, Vector3 } from 'https://unpkg.com/three@0.161.0/build/three.module.js';
+
+(() => {
+  const $ = id => document.getElementById(id);
+  const recordBtn = $('recordBtn');
+  const stopBtn   = $('stopBtn');
+  const statusEl  = $('status');
+  const counterEl = $('counter');
+
+  let samples = [];
+  let isRecording = false;
+  let recordingStartTime = 0;
+  let calibrationPhase = true;
+  const calibrationDuration = 2000;
+  let calibrationData = {
+    gravityVector: new Vector3(),
+    accelerationBias: new Vector3(),
+    samples: 0
+  };
+  let initialOrientation = {};
+
+  // Orientation quaternion (updated via deviceorientation)
+  const phoneQuat = new Quaternion();
+  let initialPhoneQuat = new Quaternion();
+  let worldGravity = new Vector3(0, 0, 9.81);
+
+  async function ensurePermission() {
+    if (DeviceMotionEvent.requestPermission) {
+      const res = await DeviceMotionEvent.requestPermission();
+      if (res !== 'granted') throw new Error('Motion permission denied');
+    }
+    if (DeviceOrientationEvent.requestPermission) {
+      const res = await DeviceOrientationEvent.requestPermission();
+      if (res !== 'granted') throw new Error('Orientation permission denied');
+    }
+  }
+
+  function handleOrientation(event) {
+    // DeviceOrientation: alpha (Z), beta (X), gamma (Y) in degrees
+    const e = new Euler(
+      event.beta  * Math.PI/180,
+      event.gamma * Math.PI/180,
+      event.alpha * Math.PI/180,
+      'ZXY'
+    );
+    phoneQuat.setFromEuler(e);
+  }
+
+  function startRecording() {
+    isRecording = true;
+    recordingStartTime = performance.now();
+    samples = [];
+    calibrationPhase = true;
+    calibrationData = { gravityVector: new Vector3(), accelerationBias: new Vector3(), samples: 0 };
+    initialOrientation = { timestamp: recordingStartTime };
+
+    statusEl.textContent = '🔴 Recording... (Calibrating - keep device still)';
+    recordBtn.textContent = 'Stop Recording';
+    recordBtn.style.background = '#dc3545';
+
+    window.addEventListener('devicemotion', handleMotionEvent, true);
+    window.addEventListener('deviceorientation', handleOrientation, true);
+  }
+
+  function stopRecording() {
+    isRecording = false;
+    calibrationPhase = false;
+    window.removeEventListener('devicemotion', handleMotionEvent, true);
+    window.removeEventListener('deviceorientation', handleOrientation, true);
+
+    statusEl.textContent = `✅ Recorded ${samples.length} samples`;
+    recordBtn.textContent = 'Start Recording';
+    recordBtn.style.background = '#007bff';
+
+    if (samples.length) {
+      // Prepend metadata
+      samples.unshift({
+        type: 'metadata',
+        initialOrientation,
+        calibrationData: {
+          gravityVector: calibrationData.gravityVector.toArray(),
+          accelerationBias: calibrationData.accelerationBias.toArray()
+        },
+        recordingDuration: performance.now() - recordingStartTime,
+        sampleRate: samples.length / ((performance.now() - recordingStartTime)/1000)
+      });
+      uploadSamples();
+    }
+  }
+
+  function handleMotionEvent(ev) {
+    if (!isRecording) return;
+    const now = performance.now();
+    const rel = now - recordingStartTime;
+
+    // Build base sample
+    const motion = {
+      timestamp: now,
+      relativeTime: rel,
+      interval: ev.interval || 16.67
+    };
+
+    // Collect raw accel & gravity incl
+    const eventAcceleration = ev.acceleration;
+    const ag = ev.accelerationIncludingGravity;
+    motion.acceleration = new Vector3(eventAcceleration.x||0, eventAcceleration.y||0, eventAcceleration.z||0);
+    motion.accelerationIncludingGravity = new Vector3(ag.x||0, ag.y||0, ag.z||0);
+    motion.rotationRate = ev.rotationRate;
+
+    // Calibration
+    if (calibrationPhase && rel < calibrationDuration) {
+      calibrationData.samples++;
+      calibrationData.gravityVector.add(motion.accelerationIncludingGravity);
+      calibrationData.accelerationBias.add(motion.acceleration);
+      const pct = Math.round((rel/calibrationDuration)*100);
+      statusEl.textContent = `🔴 Calibrating... ${pct}%`;
+      return;
+    }
+    if (calibrationPhase) {
+      calibrationPhase = false;
+      // average
+      calibrationData.gravityVector.multiplyScalar(1/calibrationData.samples);
+      calibrationData.accelerationBias.multiplyScalar(1/calibrationData.samples);
+      // capture initial orientation quaternion
+      initialPhoneQuat.copy(phoneQuat);
+      // compute worldGravity from initial sensor gravity
+      worldGravity.copy(calibrationData.gravityVector).applyQuaternion(initialPhoneQuat);
+      statusEl.textContent = '🔴 Recording motion...';
+    } else {
+        // Dynamic gravity removal
+        // compute current sensor-space gravity = worldGravity rotated by inverse current quat
+        const dynG = worldGravity.clone().applyQuaternion(phoneQuat.clone().invert());
+
+        // linear accel = measured inclG - dynG, then bias-correct
+        const lin = motion.accelerationIncludingGravity.clone().sub(dynG).sub(calibrationData.accelerationBias);
+
+        // record
+        samples.push({
+        ...motion,
+        accelerationCorrected: { x: lin.x, y: lin.y, z: lin.z },
+        accelerationNoGravity: { x: lin.x, y: lin.y, z: lin.z }
+        });
+        counterEl.textContent = samples.length;
+        if (samples.length % 100 === 0) {
+        statusEl.textContent = `🔴 Recording... ${samples.length} samples`;
+        }
+    }
+  }
+
+  function uploadSamples() {
+    statusEl.textContent = 'Uploading…';
+    fetch('save.php', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(samples)
+    })
+    .then(r=>r.json())
+    .then(json=> {
+      if (json.status==='ok') statusEl.textContent = `Saved ${json.points} ➜ ${json.file}`;
+      else throw new Error(json.message||'Server error');
+    })
+    .catch(e=> statusEl.textContent = 'Upload failed: '+e.message);
+  }
+
+  recordBtn.addEventListener('click', async () => {
+    try {
+      await ensurePermission();
+      isRecording ? stopRecording() : startRecording();
+    } catch (e) {
+      statusEl.textContent = e.message;
+    }
+  });
+
+})();
+</script>
+
+</body>
+</html>

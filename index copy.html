@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Accelerometer Recorder</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body{font-family:system-ui,Arial,sans-serif;margin:2rem;}
+    button{padding:.7rem 1.3rem;font-size:1rem;border:none;border-radius:.4rem;cursor:pointer;}
+    #recordBtn{background:#007bff;color:#fff;}
+    #stopBtn{background:#dc3545;color:#fff;display:none;}
+    #status{margin-top:1rem;font-weight:600;}
+    #counter{font-variant-numeric:tabular-nums;}
+  </style>
+</head>
+<body>
+  <h1>Phone Accelerometer Recorder</h1>
+  <button id="recordBtn">Start Recording</button>
+  <button id="stopBtn">Stop & Upload</button>
+  <p id="status">Waiting…</p>
+  <p><span id="counter">0</span> datapoints captured</p>
+
+<script type="module">
+import { Quaternion, Euler, Vector3 } from 'https://unpkg.com/three@0.161.0/build/three.module.js';
+
+(() => {
+  const $ = id => document.getElementById(id);
+  const recordBtn = $('recordBtn');
+  const stopBtn   = $('stopBtn');
+  const statusEl  = $('status');
+  const counterEl = $('counter');
+
+  let samples = [];
+  let recording = false;
+  let orientHandler = null;
+
+  // For gravity removal
+  const phoneQuat = new Quaternion();
+  const worldGravity = new Vector3(0, 0, 9.81);
+
+  // For bias estimation
+  const biasWindow = [];
+  const BIAS_SAMPLE_COUNT = 50;  // first N samples used to compute bias
+
+  async function ensurePermission () {
+    if (
+      window.DeviceMotionEvent &&
+      typeof window.DeviceMotionEvent.requestPermission === 'function'
+    ) {
+      const res = await DeviceMotionEvent.requestPermission();
+      if (res !== 'granted') throw new Error('Motion permission denied');
+    }
+    if (
+      window.DeviceOrientationEvent &&
+      typeof window.DeviceOrientationEvent.requestPermission === 'function'
+    ) {
+      const res = await DeviceOrientationEvent.requestPermission();
+      if (res !== 'granted') throw new Error('Orientation permission denied');
+    }
+  }
+
+
+  // Global recording state
+let isRecording = false;
+let motionHandler = null;
+let recordingStartTime = null;
+let initialOrientation = null;
+let calibrationData = {
+  gravityVector: { x: 0, y: 0, z: 0 },
+  accelerationBias: { x: 0, y: 0, z: 0 },
+  samples: 0
+};
+let calibrationPhase = true;
+const calibrationDuration = 2000; // 2 seconds calibration
+
+// Start recording function
+function startRecording() {
+  isRecording = true;
+  recordingStartTime = performance.now();
+  samples = []; // Clear previous samples
+  calibrationPhase = true;
+  calibrationData = {
+    gravityVector: { x: 0, y: 0, z: 0 },
+    accelerationBias: { x: 0, y: 0, z: 0 },
+    samples: 0
+  };
+  
+  // Record initial device orientation
+  initialOrientation = {
+    screenOrientation: screen.orientation?.angle || 0,
+    userAgent: navigator.userAgent,
+    timestamp: recordingStartTime
+  };
+  
+  statusEl.textContent = '🔴 Recording... (Calibrating - keep device still)';
+  recordBtn.textContent = 'Stop Recording';
+  recordBtn.style.background = '#dc3545';
+  
+  // Add motion event listener
+  window.addEventListener('devicemotion', handleMotionEvent, true);
+}
+
+// Stop recording function
+function stopRecording() {
+  isRecording = false;
+  calibrationPhase = false;
+  
+  if (motionHandler) {
+    window.removeEventListener('devicemotion', motionHandler);
+    motionHandler = null;
+  }
+  
+  // Remove the motion event listener
+  window.removeEventListener('devicemotion', handleMotionEvent, true);
+  
+  statusEl.textContent = `✅ Recorded ${samples.length} motion samples`;
+  recordBtn.textContent = 'Start Recording';
+  recordBtn.style.background = '#007bff';
+  
+  // Add metadata to samples
+  if (samples.length > 0) {
+    samples.unshift({
+      type: 'metadata',
+      initialOrientation: initialOrientation,
+      calibrationData: calibrationData,
+      recordingDuration: performance.now() - recordingStartTime,
+      sampleRate: samples.length / ((performance.now() - recordingStartTime) / 1000)
+    });
+
+    uploadSamples();
+  }
+}
+
+// Motion event handler function
+function handleMotionEvent(event) {
+  if (!isRecording) return;
+  
+  const currentTime = performance.now();
+  const relativeTime = currentTime - recordingStartTime;
+  
+  // Extract motion data
+  const motionData = {
+    timestamp: currentTime,
+    relativeTime: relativeTime,
+    interval: event.interval || 16.67, // Default to ~60Hz if not provided
+    
+    // Acceleration without gravity
+    acceleration: {
+      x: event.acceleration?.x || 0,
+      y: event.acceleration?.y || 0,
+      z: event.acceleration?.z || 0
+    },
+    
+    // Total acceleration including gravity
+    accelerationIncludingGravity: {
+      x: event.accelerationIncludingGravity?.x || 0,
+      y: event.accelerationIncludingGravity?.y || 0,
+      z: event.accelerationIncludingGravity?.z || 0
+    },
+    
+    // Rotation rates in degrees/second
+    rotationRate: {
+      alpha: event.rotationRate?.alpha || 0, // Z-axis
+      beta: event.rotationRate?.beta || 0,   // X-axis
+      gamma: event.rotationRate?.gamma || 0  // Y-axis
+    }
+  };
+  
+  // Calibration phase - collect baseline data
+  if (calibrationPhase && relativeTime < calibrationDuration) {
+    calibrationData.samples++;
+    
+    // Accumulate gravity vector (should be steady during calibration)
+    calibrationData.gravityVector.x += motionData.accelerationIncludingGravity.x;
+    calibrationData.gravityVector.y += motionData.accelerationIncludingGravity.y;
+    calibrationData.gravityVector.z += motionData.accelerationIncludingGravity.z;
+    
+    // Accumulate acceleration bias (should be near zero when stationary)
+    calibrationData.accelerationBias.x += motionData.acceleration.x;
+    calibrationData.accelerationBias.y += motionData.acceleration.y;
+    calibrationData.accelerationBias.z += motionData.acceleration.z;
+    
+    // Update status
+    const progress = Math.round((relativeTime / calibrationDuration) * 100);
+    statusEl.textContent = `🔴 Calibrating... ${progress}% (keep device still)`;
+    
+  } else if (calibrationPhase) {
+    // End calibration phase
+    calibrationPhase = false;
+    
+    // Calculate averages
+    if (calibrationData.samples > 0) {
+      calibrationData.gravityVector.x /= calibrationData.samples;
+      calibrationData.gravityVector.y /= calibrationData.samples;
+      calibrationData.gravityVector.z /= calibrationData.samples;
+      
+      calibrationData.accelerationBias.x /= calibrationData.samples;
+      calibrationData.accelerationBias.y /= calibrationData.samples;
+      calibrationData.accelerationBias.z /= calibrationData.samples;
+    }
+    
+    statusEl.textContent = '🔴 Recording motion... (you can move now)';
+  } else {
+  
+    // Apply calibration corrections
+    const correctedData = {
+        ...motionData,
+        
+        // Bias-corrected acceleration
+        accelerationCorrected: {
+        x: motionData.acceleration.x - calibrationData.accelerationBias.x,
+        y: motionData.acceleration.y - calibrationData.accelerationBias.y,
+        z: motionData.acceleration.z - calibrationData.accelerationBias.z
+        },
+        
+        // Gravity-removed acceleration (alternative calculation)
+        accelerationNoGravity: {
+        x: motionData.accelerationIncludingGravity.x - calibrationData.gravityVector.x,
+        y: motionData.accelerationIncludingGravity.y - calibrationData.gravityVector.y,
+        z: motionData.accelerationIncludingGravity.z - calibrationData.gravityVector.z
+        },
+        
+        // Calculate magnitude for quality assessment
+        accelerationMagnitude: Math.sqrt(
+        Math.pow(motionData.acceleration.x, 2) +
+        Math.pow(motionData.acceleration.y, 2) +
+        Math.pow(motionData.acceleration.z, 2)
+        ),
+        
+        rotationMagnitude: Math.sqrt(
+        Math.pow(motionData.rotationRate.alpha, 2) +
+        Math.pow(motionData.rotationRate.beta, 2) +
+        Math.pow(motionData.rotationRate.gamma, 2)
+        )
+    };
+    
+    // Add to samples array
+    samples.push(correctedData);
+    
+    // Update UI periodically (every 100 samples to avoid performance issues)
+    if (samples.length % 100 === 0) {
+        statusEl.textContent = `🔴 Recording... ${samples.length} samples (${(relativeTime/1000).toFixed(1)}s)`;
+    }
+    }
+}
+
+// Main event listener
+recordBtn.addEventListener('click', async () => {
+  try {
+    await ensurePermission();
+
+    // Toggle recording state
+    if (!isRecording) {
+      startRecording();
+    } else {
+      stopRecording();
+    }
+    
+    // warn if no motion in 1s
+    setTimeout(() => {
+      if (samples.length === 0) {
+        statusEl.textContent =
+          '⚠️ No motion events yet—check HTTPS & sensor permissions.';
+      }
+    }, 1000);
+
+  } catch (err) {
+    statusEl.textContent = err.message;
+    resetUI();
+  }
+});
+
+
+//   stopBtn.addEventListener('click', async () => {
+//     if (!recording) return;
+
+//     isRecording =
+//     recording = false;
+
+//     // tear down listeners
+//     window.removeEventListener('devicemotion', motionHandler);
+//     window.removeEventListener('deviceorientation', orientHandler);
+
+//     stopBtn.disabled = true;
+
+//     if (samples.length === 0) {
+//       statusEl.textContent = 'No data captured.';
+//       resetUI();
+//       return;
+//     }
+
+//     // compute bias (mean of first biasWindow samples)
+//     const bias = biasWindow.reduce((acc, v) => acc.add(v), new Vector3())
+//       .multiplyScalar(1 / biasWindow.length);
+
+//     // subtract bias from all samples
+//     const corrected = samples.map(s => ({
+//       t:        s.t,
+//       ax:       s.ax_lin - bias.x,
+//       ay:       s.ay_lin - bias.y,
+//       az:       s.az_lin - bias.z,
+//       qx:       s.qx,
+//       qy:       s.qy,
+//       qz:       s.qz,
+//       qw:       s.qw,
+//       interval: s.interval
+//     }));
+
+//     statusEl.textContent = 'Uploading…';
+//     try {
+//       const resp = await fetch('save.php', {
+//         method : 'POST',
+//         headers: { 'Content-Type': 'application/json' },
+//         body   : JSON.stringify(corrected)
+//       });
+//       const json = await resp.json();
+//       if (json.status === 'ok') {
+//         statusEl.textContent = `Saved ${json.points} points ➜ ${json.file}`;
+//       } else {
+//         throw new Error(json.message ?? 'Server error');
+//       }
+//     } catch (err) {
+//       statusEl.textContent = 'Upload failed: ' + err.message;
+//     }
+//     resetUI();
+//   });
+
+function uploadSamples() {
+    if (samples.length === 0) {
+        statusEl.textContent = 'No data captured.';
+        resetUI();
+        return;
+    }
+
+    statusEl.textContent = 'Uploading…';
+
+    fetch('save.php', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(samples)
+    })
+    .then(response => response.json())
+    .then(json => {
+        if (json.status === 'ok') {
+            statusEl.textContent = `Saved ${json.points} points ➜ ${json.file}`;
+        } else {
+            throw new Error(json.message ?? 'Server error');
+        }
+    })
+    .catch(err => {
+        statusEl.textContent = 'Upload failed: ' + err.message;
+    })
+    .finally(() => {
+        resetUI();
+    });
+}
+
+  function resetUI () {
+    stopBtn.disabled = false;
+    stopBtn.style.display = 'none';
+    recordBtn.style.display = 'inline-block';
+  }
+})();
+</script>
+
+</body>
+</html>
